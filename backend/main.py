@@ -4,10 +4,15 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import threading
+import time
 import uuid
+from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import datetime
 from importlib import metadata, util
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +20,17 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from openpyxl import Workbook
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from pydantic import BaseModel, Field
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps, ImageStat
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 SCREENSHOTS_DIR = BASE_DIR / "screenshots"
 DATA_DIR = BASE_DIR / "work" / "data"
 OUTPUTS_DIR = BASE_DIR / "outputs"
-APP_VERSION = "1.5.0"
+APP_VERSION = "2.0.0"
+PAGE_CHANGE_THRESHOLD = 0.015
+STABLE_WAIT_SECONDS = 0.5
+MAX_UNCHANGED_CAPTURES = 3
 
 ORDER_FIELDS = [
     "订单编号",
@@ -33,7 +42,7 @@ ORDER_FIELDS = [
     "下单时间",
 ]
 
-app = FastAPI(title="订单录屏智能采集与结构化提取工具 - Phase 1.5")
+app = FastAPI(title="订单录屏智能采集与结构化提取工具 - Phase 2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -47,6 +56,39 @@ app.add_middleware(
 class OcrLine:
     text: str
     score: float | None = None
+
+
+@dataclass
+class DeviceStatus:
+    adb_available: bool
+    scrcpy_available: bool
+    connected: bool
+    device_id: str | None = None
+    resolution: str | None = None
+    message: str = ""
+
+
+@dataclass
+class CaptureJobState:
+    session_id: str = ""
+    running: bool = False
+    status: str = "idle"
+    current_step: str = "待开始"
+    screenshot_count: int = 0
+    ocr_count: int = 0
+    success_order_count: int = 0
+    skipped_count: int = 0
+    target_count: int = 0
+    error: str = ""
+    excel_file: str = ""
+    ocr_result: str = ""
+    records: list[dict[str, Any]] | None = None
+
+
+class CaptureSettings(BaseModel):
+    interval_seconds: float = Field(default=3, ge=1, le=10)
+    swipe_distance: int = Field(default=500, ge=100, le=2500)
+    max_count: int = Field(default=20, ge=1, le=500)
 
 
 class OcrEngine:
@@ -115,6 +157,9 @@ class OcrEngine:
 
 
 ocr_engine = OcrEngine()
+capture_state = CaptureJobState(records=[])
+capture_lock = threading.Lock()
+stop_capture_event = threading.Event()
 
 
 def ensure_dirs() -> None:
@@ -137,6 +182,114 @@ def preprocess_image(src: Path, dest: Path) -> None:
         image = ImageEnhance.Sharpness(image).enhance(1.6)
         image = image.filter(ImageFilter.SHARPEN)
         image.save(dest, optimize=True)
+
+
+def command_exists(command: str) -> bool:
+    return shutil.which(command) is not None
+
+
+def run_adb(args: list[str], timeout: int = 10, binary: bool = False) -> subprocess.CompletedProcess:
+    adb_path = shutil.which("adb")
+    if not adb_path:
+        raise RuntimeError("未找到 adb，请先安装 Android Platform Tools。")
+    return subprocess.run(
+        [adb_path, *args],
+        check=False,
+        capture_output=True,
+        timeout=timeout,
+        text=not binary,
+    )
+
+
+def get_device_status() -> DeviceStatus:
+    adb_available = command_exists("adb")
+    scrcpy_available = command_exists("scrcpy")
+    if not adb_available:
+        return DeviceStatus(
+            adb_available=False,
+            scrcpy_available=scrcpy_available,
+            connected=False,
+            message="未找到 adb，请先安装 Android Platform Tools。",
+        )
+
+    try:
+        result = run_adb(["devices"], timeout=5)
+    except Exception as exc:
+        return DeviceStatus(adb_available=True, scrcpy_available=scrcpy_available, connected=False, message=str(exc))
+
+    devices: list[tuple[str, str]] = []
+    for line in result.stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2:
+            devices.append((parts[0], parts[1]))
+
+    connected = [device_id for device_id, state in devices if state == "device"]
+    if not connected:
+        states = ", ".join(f"{device_id}:{state}" for device_id, state in devices)
+        return DeviceStatus(
+            adb_available=True,
+            scrcpy_available=scrcpy_available,
+            connected=False,
+            message=f"未检测到可用设备。{states}" if states else "未检测到设备。",
+        )
+
+    device_id = connected[0]
+    resolution = None
+    size_result = run_adb(["-s", device_id, "shell", "wm", "size"], timeout=5)
+    match = re.search(r"Physical size:\s*(\d+x\d+)", size_result.stdout)
+    if match:
+        resolution = match.group(1)
+
+    return DeviceStatus(
+        adb_available=True,
+        scrcpy_available=scrcpy_available,
+        connected=True,
+        device_id=device_id,
+        resolution=resolution,
+        message="已连接",
+    )
+
+
+def capture_phone_image(device_id: str) -> Image.Image:
+    result = run_adb(["-s", device_id, "exec-out", "screencap", "-p"], timeout=15, binary=True)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="ignore") if isinstance(result.stderr, bytes) else result.stderr
+        raise RuntimeError(stderr.strip() or "手机截图失败。")
+    data = result.stdout.replace(b"\r\n", b"\n")
+    return Image.open(BytesIO(data)).convert("RGB")
+
+
+def save_phone_screenshot(device_id: str, path: Path) -> None:
+    image = capture_phone_image(device_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path, optimize=True)
+
+
+def image_difference_ratio(left: Path, right: Path) -> float:
+    with Image.open(left) as left_image, Image.open(right) as right_image:
+        left_gray = ImageOps.grayscale(left_image).resize((128, 128))
+        right_gray = ImageOps.grayscale(right_image).resize((128, 128))
+        diff = ImageChops.difference(left_gray, right_gray)
+        stat = ImageStat.Stat(diff)
+        return (stat.mean[0] or 0) / 255
+
+
+def swipe_phone(device_id: str, distance: int, resolution: str | None) -> None:
+    width, height = 1080, 1920
+    if resolution:
+        match = re.search(r"(\d+)x(\d+)", resolution)
+        if match:
+            width, height = int(match.group(1)), int(match.group(2))
+    x = width // 2
+    start_y = int(height * 0.75)
+    end_y = max(int(height * 0.2), start_y - distance)
+    result = run_adb(["-s", device_id, "shell", "input", "swipe", str(x), str(start_y), str(x), str(end_y), "350"], timeout=10)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "滑动失败。")
+
+
+def is_successful_order(parsed: dict[str, str]) -> bool:
+    return bool(parsed.get("商品名称") and parsed.get("订单金额"))
 
 
 def next_screenshot_name(index: int, suffix: str) -> str:
@@ -385,6 +538,116 @@ def write_excel(session_id: str, records: list[dict[str, Any]]) -> Path:
     return path
 
 
+def set_capture_state(**kwargs: Any) -> None:
+    with capture_lock:
+        for key, value in kwargs.items():
+            setattr(capture_state, key, value)
+
+
+def get_capture_state_payload() -> dict[str, Any]:
+    with capture_lock:
+        payload = asdict(capture_state)
+        payload["records"] = capture_state.records or []
+        return payload
+
+
+def run_capture_job(settings: CaptureSettings, device: DeviceStatus) -> None:
+    assert device.device_id
+    session_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
+    session_dir = SCREENSHOTS_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+    previous_image: Path | None = None
+    unchanged_count = 0
+
+    set_capture_state(
+        session_id=session_id,
+        running=True,
+        status="running",
+        current_step="准备采集",
+        screenshot_count=0,
+        ocr_count=0,
+        success_order_count=0,
+        skipped_count=0,
+        target_count=settings.max_count,
+        error="",
+        excel_file="",
+        ocr_result="",
+        records=records,
+    )
+
+    try:
+        for attempt in range(1, settings.max_count + 1):
+            if stop_capture_event.is_set():
+                set_capture_state(status="stopped", current_step="已停止")
+                break
+
+            image_name = next_screenshot_name(attempt, ".png")
+            image_path = session_dir / image_name
+            first_path = session_dir / f"stable_check_{attempt:03d}.png"
+            ocr_image_path = session_dir / f"ocr_{Path(image_name).stem}.png"
+
+            set_capture_state(current_step="截图")
+            save_phone_screenshot(device.device_id, first_path)
+            time.sleep(STABLE_WAIT_SECONDS)
+            save_phone_screenshot(device.device_id, image_path)
+            first_path.unlink(missing_ok=True)
+
+            if previous_image and image_difference_ratio(previous_image, image_path) < PAGE_CHANGE_THRESHOLD:
+                unchanged_count += 1
+                image_path.unlink(missing_ok=True)
+                set_capture_state(skipped_count=capture_state.skipped_count + 1, current_step="页面未变化，跳过 OCR")
+            else:
+                unchanged_count = 0
+                previous_image = image_path
+                set_capture_state(screenshot_count=capture_state.screenshot_count + 1, current_step="OCR 处理中")
+                preprocess_image(image_path, ocr_image_path)
+                lines = ocr_engine.recognize(ocr_image_path)
+                text = "\n".join(line.text for line in lines)
+                parsed = parse_order_fields(text)
+                record = {
+                    "image": image_name,
+                    "ocr_image": ocr_image_path.name,
+                    "text": text,
+                    "lines": [{"text": line.text, "score": line.score} for line in lines],
+                    "parsed": parsed,
+                }
+                records.append(record)
+                ocr_json_path = write_ocr_json(session_id, records)
+                excel_path = write_excel(session_id, records)
+                set_capture_state(
+                    ocr_count=capture_state.ocr_count + 1,
+                    success_order_count=sum(1 for item in records if is_successful_order(item["parsed"])),
+                    ocr_result=ocr_json_path.name,
+                    excel_file=excel_path.name,
+                    records=records,
+                    current_step="OCR 完成",
+                )
+
+            if unchanged_count >= MAX_UNCHANGED_CAPTURES:
+                set_capture_state(status="completed", current_step="页面连续无变化，已结束")
+                break
+
+            if attempt < settings.max_count and not stop_capture_event.is_set():
+                set_capture_state(current_step="滑动")
+                swipe_phone(device.device_id, settings.swipe_distance, device.resolution)
+                time.sleep(settings.interval_seconds)
+        else:
+            set_capture_state(status="completed", current_step="已完成")
+
+        if capture_state.status == "running":
+            set_capture_state(status="completed", current_step="已完成")
+        if not records:
+            ocr_json_path = write_ocr_json(session_id, records)
+            excel_path = write_excel(session_id, records)
+            set_capture_state(ocr_result=ocr_json_path.name, excel_file=excel_path.name)
+    except Exception as exc:
+        set_capture_state(running=False, status="error", current_step="采集失败", error=str(exc), records=records)
+        return
+
+    set_capture_state(running=False, records=records)
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "ocr_engine": ocr_engine.name}
@@ -400,6 +663,49 @@ def config() -> dict[str, str | bool]:
         "ocr_engine_version": ocr_engine.version(),
         "status": ocr_engine.status(),
     }
+
+
+@app.get("/api/device/status")
+def device_status() -> dict[str, Any]:
+    return asdict(get_device_status())
+
+
+@app.get("/api/device/screenshot")
+def device_screenshot() -> FileResponse:
+    device = get_device_status()
+    if not device.connected or not device.device_id:
+        raise HTTPException(status_code=503, detail=device.message or "手机未连接。")
+    preview_path = BASE_DIR / "work" / "device_screen.png"
+    save_phone_screenshot(device.device_id, preview_path)
+    return FileResponse(preview_path, media_type="image/png", filename="device_screen.png")
+
+
+@app.post("/api/capture/start")
+def start_capture(settings: CaptureSettings) -> dict[str, Any]:
+    with capture_lock:
+        if capture_state.running:
+            raise HTTPException(status_code=409, detail="采集任务正在运行。")
+
+    device = get_device_status()
+    if not device.connected or not device.device_id:
+        raise HTTPException(status_code=503, detail=device.message or "手机未连接。")
+
+    stop_capture_event.clear()
+    thread = threading.Thread(target=run_capture_job, args=(settings, device), daemon=True)
+    thread.start()
+    return get_capture_state_payload()
+
+
+@app.get("/api/capture/status")
+def capture_status() -> dict[str, Any]:
+    return get_capture_state_payload()
+
+
+@app.post("/api/capture/stop")
+def stop_capture() -> dict[str, Any]:
+    stop_capture_event.set()
+    set_capture_state(current_step="正在停止")
+    return get_capture_state_payload()
 
 
 @app.post("/api/ocr/upload")
