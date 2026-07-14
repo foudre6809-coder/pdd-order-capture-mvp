@@ -4,15 +4,10 @@ import json
 import os
 import re
 import shutil
-import subprocess
-import threading
-import time
 import uuid
-from dataclasses import asdict
 from dataclasses import dataclass
 from datetime import datetime
 from importlib import metadata, util
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -20,29 +15,17 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from openpyxl import Workbook
-from pydantic import BaseModel, Field
-from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps, ImageStat
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 SCREENSHOTS_DIR = BASE_DIR / "screenshots"
 DATA_DIR = BASE_DIR / "work" / "data"
 OUTPUTS_DIR = BASE_DIR / "outputs"
-APP_VERSION = "2.0.0"
-PAGE_CHANGE_THRESHOLD = 0.015
-STABLE_WAIT_SECONDS = 0.5
-MAX_UNCHANGED_CAPTURES = 3
+APP_VERSION = "3.0.0"
 
-ORDER_FIELDS = [
-    "订单编号",
-    "商品名称",
-    "商品规格",
-    "数量",
-    "订单金额",
-    "订单状态",
-    "下单时间",
-]
+EXPORT_FIELDS = ["序号", "商品信息", "实付款", "截图文件"]
 
-app = FastAPI(title="订单录屏智能采集与结构化提取工具 - Phase 2")
+app = FastAPI(title="拼多多订单截图 OCR 提取工具")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -56,39 +39,7 @@ app.add_middleware(
 class OcrLine:
     text: str
     score: float | None = None
-
-
-@dataclass
-class DeviceStatus:
-    adb_available: bool
-    scrcpy_available: bool
-    connected: bool
-    device_id: str | None = None
-    resolution: str | None = None
-    message: str = ""
-
-
-@dataclass
-class CaptureJobState:
-    session_id: str = ""
-    running: bool = False
-    status: str = "idle"
-    current_step: str = "待开始"
-    screenshot_count: int = 0
-    ocr_count: int = 0
-    success_order_count: int = 0
-    skipped_count: int = 0
-    target_count: int = 0
-    error: str = ""
-    excel_file: str = ""
-    ocr_result: str = ""
-    records: list[dict[str, Any]] | None = None
-
-
-class CaptureSettings(BaseModel):
-    interval_seconds: float = Field(default=3, ge=1, le=10)
-    swipe_distance: int = Field(default=500, ge=100, le=2500)
-    max_count: int = Field(default=20, ge=1, le=500)
+    box: list[list[float]] | None = None
 
 
 class OcrEngine:
@@ -141,7 +92,7 @@ class OcrEngine:
             result = engine.ocr(str(image_path), cls=True)
             raw_items = result[0] if result else []
             return [
-                OcrLine(text=str(item[1][0]).strip(), score=float(item[1][1]))
+                OcrLine(text=str(item[1][0]).strip(), score=float(item[1][1]), box=normalize_box(item[0]))
                 for item in raw_items
                 if item and item[1] and str(item[1][0]).strip()
             ]
@@ -152,19 +103,41 @@ class OcrEngine:
             text = str(item[1]).strip()
             score = float(item[2]) if len(item) > 2 and item[2] is not None else None
             if text:
-                lines.append(OcrLine(text=text, score=score))
+                lines.append(OcrLine(text=text, score=score, box=normalize_box(item[0])))
         return lines
 
 
 ocr_engine = OcrEngine()
-capture_state = CaptureJobState(records=[])
-capture_lock = threading.Lock()
-stop_capture_event = threading.Event()
 
 
 def ensure_dirs() -> None:
     for path in (SCREENSHOTS_DIR, DATA_DIR, OUTPUTS_DIR):
         path.mkdir(parents=True, exist_ok=True)
+
+
+def normalize_box(value: Any) -> list[list[float]] | None:
+    if not value:
+        return None
+    try:
+        return [[float(point[0]), float(point[1])] for point in value]
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def box_center_y(line: OcrLine) -> float:
+    if not line.box:
+        return 0
+    return sum(point[1] for point in line.box) / len(line.box)
+
+
+def box_center_x(line: OcrLine) -> float:
+    if not line.box:
+        return 0
+    return sum(point[0] for point in line.box) / len(line.box)
+
+
+def line_to_dict(line: OcrLine) -> dict[str, Any]:
+    return {"text": line.text, "score": line.score, "box": line.box}
 
 
 def normalize_image(src: Path, dest: Path) -> None:
@@ -184,114 +157,6 @@ def preprocess_image(src: Path, dest: Path) -> None:
         image.save(dest, optimize=True)
 
 
-def command_exists(command: str) -> bool:
-    return shutil.which(command) is not None
-
-
-def run_adb(args: list[str], timeout: int = 10, binary: bool = False) -> subprocess.CompletedProcess:
-    adb_path = shutil.which("adb")
-    if not adb_path:
-        raise RuntimeError("未找到 adb，请先安装 Android Platform Tools。")
-    return subprocess.run(
-        [adb_path, *args],
-        check=False,
-        capture_output=True,
-        timeout=timeout,
-        text=not binary,
-    )
-
-
-def get_device_status() -> DeviceStatus:
-    adb_available = command_exists("adb")
-    scrcpy_available = command_exists("scrcpy")
-    if not adb_available:
-        return DeviceStatus(
-            adb_available=False,
-            scrcpy_available=scrcpy_available,
-            connected=False,
-            message="未找到 adb，请先安装 Android Platform Tools。",
-        )
-
-    try:
-        result = run_adb(["devices"], timeout=5)
-    except Exception as exc:
-        return DeviceStatus(adb_available=True, scrcpy_available=scrcpy_available, connected=False, message=str(exc))
-
-    devices: list[tuple[str, str]] = []
-    for line in result.stdout.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) >= 2:
-            devices.append((parts[0], parts[1]))
-
-    connected = [device_id for device_id, state in devices if state == "device"]
-    if not connected:
-        states = ", ".join(f"{device_id}:{state}" for device_id, state in devices)
-        return DeviceStatus(
-            adb_available=True,
-            scrcpy_available=scrcpy_available,
-            connected=False,
-            message=f"未检测到可用设备。{states}" if states else "未检测到设备。",
-        )
-
-    device_id = connected[0]
-    resolution = None
-    size_result = run_adb(["-s", device_id, "shell", "wm", "size"], timeout=5)
-    match = re.search(r"Physical size:\s*(\d+x\d+)", size_result.stdout)
-    if match:
-        resolution = match.group(1)
-
-    return DeviceStatus(
-        adb_available=True,
-        scrcpy_available=scrcpy_available,
-        connected=True,
-        device_id=device_id,
-        resolution=resolution,
-        message="已连接",
-    )
-
-
-def capture_phone_image(device_id: str) -> Image.Image:
-    result = run_adb(["-s", device_id, "exec-out", "screencap", "-p"], timeout=15, binary=True)
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="ignore") if isinstance(result.stderr, bytes) else result.stderr
-        raise RuntimeError(stderr.strip() or "手机截图失败。")
-    data = result.stdout.replace(b"\r\n", b"\n")
-    return Image.open(BytesIO(data)).convert("RGB")
-
-
-def save_phone_screenshot(device_id: str, path: Path) -> None:
-    image = capture_phone_image(device_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(path, optimize=True)
-
-
-def image_difference_ratio(left: Path, right: Path) -> float:
-    with Image.open(left) as left_image, Image.open(right) as right_image:
-        left_gray = ImageOps.grayscale(left_image).resize((128, 128))
-        right_gray = ImageOps.grayscale(right_image).resize((128, 128))
-        diff = ImageChops.difference(left_gray, right_gray)
-        stat = ImageStat.Stat(diff)
-        return (stat.mean[0] or 0) / 255
-
-
-def swipe_phone(device_id: str, distance: int, resolution: str | None) -> None:
-    width, height = 1080, 1920
-    if resolution:
-        match = re.search(r"(\d+)x(\d+)", resolution)
-        if match:
-            width, height = int(match.group(1)), int(match.group(2))
-    x = width // 2
-    start_y = int(height * 0.75)
-    end_y = max(int(height * 0.2), start_y - distance)
-    result = run_adb(["-s", device_id, "shell", "input", "swipe", str(x), str(start_y), str(x), str(end_y), "350"], timeout=10)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "滑动失败。")
-
-
-def is_successful_order(parsed: dict[str, str]) -> bool:
-    return bool(parsed.get("商品名称") and parsed.get("订单金额"))
-
-
 def next_screenshot_name(index: int, suffix: str) -> str:
     ext = suffix.lower()
     if ext not in {".png", ".jpg", ".jpeg", ".webp"}:
@@ -299,353 +164,218 @@ def next_screenshot_name(index: int, suffix: str) -> str:
     return f"{index:03d}{ext}"
 
 
-def extract_first(patterns: list[str], text: str) -> str:
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            return match.group(1).strip(" ：:，,。")
-    return ""
+def clean_text(value: str) -> str:
+    value = value.replace("￥", "¥")
+    value = re.sub(r"[ \t]+", " ", value)
+    return value.strip(" ：:，,。")
 
 
-def clean_ocr_text(text: str) -> str:
-    text = text.replace("￥", "¥")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{2,}", "\n", text)
-    return text.strip()
-
-
-def text_lines(text: str) -> list[str]:
-    return [line.strip(" ：:，,。") for line in clean_ocr_text(text).splitlines() if line.strip()]
-
-
-def normalize_datetime(value: str) -> str:
-    value = value.strip(" ：:，,。")
-    value = value.replace("年", "-").replace("月", "-").replace("日", "")
-    value = value.replace("/", "-").replace(".", "-")
-    value = re.sub(r"(\d{4}-\d{1,2}-\d{1,2})(\d{1,2}:\d{2})", r"\1 \2", value)
-    value = re.sub(r"\s+", " ", value)
-    match = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})(?:\s*(\d{1,2}):(\d{2})(?::(\d{2}))?)?", value)
-    if not match:
-        return value
-    year, month, day, hour, minute, second = match.groups()
-    date = f"{year}-{int(month):02d}-{int(day):02d}"
-    if hour and minute:
-        return f"{date} {int(hour):02d}:{minute}:{second or '00'}"
-    return date
-
-
-def infer_order_id(lines: list[str], text: str) -> str:
-    labeled = extract_first(
-        [
-            r"订单编号[:：]?\s*([A-Za-z0-9-]{6,})",
-            r"订单号[:：]?\s*([A-Za-z0-9-]{6,})",
-        ],
-        text,
-    )
-    if labeled:
-        return labeled
-    for line in lines:
-        match = re.search(r"\b([0-9]{12,24})\b", line)
-        if match and not re.search(r"20\d{2}[-/.年]", line):
-            return match.group(1)
-    return ""
-
-
-def infer_amount(lines: list[str]) -> str:
-    priority_words = ("实付", "实付款", "支付", "合计", "订单金额", "付款")
-    candidates: list[tuple[int, float, str]] = []
-    for line in lines:
-        for match in re.finditer(r"(?:¥|￥)?\s*([0-9]+(?:\.[0-9]{1,2})?)", line):
-            raw = match.group(1)
-            amount = float(raw)
-            if amount <= 0:
-                continue
-            priority = 10 if any(word in line for word in priority_words) else 1
-            if "优惠" in line or "减" in line or "券" in line:
-                priority -= 3
-            candidates.append((priority, amount, raw))
-    if not candidates:
+def extract_paid_amount(text: str) -> str:
+    normalized = clean_text(text)
+    if "实" not in normalized or "付" not in normalized:
         return ""
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return f"{candidates[0][1]:.2f}"
+    match = re.search(r"实\s*付(?:款)?[^0-9¥]{0,8}¥?\s*([0-9]+(?:[.,][0-9]{1,2})?)", normalized)
+    if not match:
+        match = re.search(r"¥\s*([0-9]+(?:[.,][0-9]{1,2})?)", normalized)
+    if not match:
+        return ""
+    return match.group(1).replace(",", ".")
 
 
-def infer_status(lines: list[str]) -> str:
-    statuses = [
+def chinese_count(text: str) -> int:
+    return len(re.findall(r"[\u4e00-\u9fff]", text))
+
+
+def is_title_candidate(text: str) -> bool:
+    value = clean_text(text)
+    if chinese_count(value) < 4:
+        return False
+    reject_words = (
+        "我的订单",
+        "全部",
         "待付款",
-        "待分享",
-        "待发货",
+        "拼团中",
         "打包中",
         "待收货",
-        "已发货",
-        "待评价",
-        "已完成",
-        "交易成功",
+        "评价",
         "拼单成功",
-        "退款中",
-        "退款成功",
-        "已退款",
-        "已取消",
-        "已关闭",
-    ]
-    for line in lines:
-        for status in statuses:
-            if status in line:
-                return status
-    return ""
-
-
-def infer_order_time(lines: list[str], text: str) -> str:
-    labeled = extract_first(
-        [
-            r"(?:下单时间|创建时间|订单时间|成交时间|支付时间)[:：]?\s*([0-9]{4}[-/.年][0-9]{1,2}[-/.月][0-9]{1,2}[^\n]*)",
-        ],
-        text,
-    )
-    if labeled:
-        return normalize_datetime(labeled)
-    for line in lines:
-        match = re.search(r"([0-9]{4}[-/.年][0-9]{1,2}[-/.月][0-9]{1,2}(?:\s*[0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)?)", line)
-        if match:
-            return normalize_datetime(match.group(1))
-    return ""
-
-
-def infer_title(lines: list[str], text: str) -> str:
-    labeled = extract_first(
-        [
-            r"商品(?:名称)?[:：]\s*([^\n]+)",
-            r"标题[:：]\s*([^\n]+)",
-        ],
-        text,
-    )
-    if labeled:
-        return labeled
-
-    reject_words = (
-        "拼多多",
-        "订单详情",
-        "订单编号",
-        "订单号",
-        "实付",
-        "支付",
-        "合计",
-        "订单金额",
-        "下单时间",
-        "创建时间",
-        "订单时间",
-        "规格",
-        "颜色",
-        "尺码",
-        "数量",
+        "申请退款",
+        "再次拼单",
+        "催发货",
+        "确认收货",
         "查看物流",
-        "联系商家",
-        "联系卖家",
         "申请售后",
         "更多",
+        "实付",
+        "免运费",
+        "退货包运费",
+        "7天无理由",
+        "7天价保",
+        "商家正在",
+        "预计",
+        "快递",
+        "旗舰店",
+        "百亿补贴",
     )
-    status = infer_status(lines)
-    candidates: list[str] = []
-    for line in lines:
-        if status and status in line:
-            continue
-        if any(word in line for word in reject_words):
-            continue
-        if re.search(r"20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2}", line):
-            continue
-        if re.fullmatch(r"[A-Za-z0-9 -]{6,}", line):
-            continue
-        if re.search(r"(?:¥|￥)\s*\d", line):
-            continue
-        if len(re.findall(r"[\u4e00-\u9fff]", line)) >= 4:
-            candidates.append(line)
+    if any(word in value for word in reject_words):
+        return False
+    if re.search(r"(?:¥|￥)\s*\d", value):
+        return False
+    if re.search(r"^[xX×]\s*\d+$", value):
+        return False
+    if re.search(r"[|｜]", value):
+        return False
+    if re.search(r"(黑色|白色|灰色|蓝色|红色|绿色|黄色|紫色|粉色).{0,8}(XL|XXL|L码|M码|S码)", value, re.IGNORECASE):
+        return False
+    if "【" in value and "】" in value and len(value) < 28:
+        return False
+    if value.endswith(("店", "店>", "店›", ">")):
+        return False
+    return True
+
+
+def title_score(text: str) -> int:
+    value = clean_text(text)
+    score = chinese_count(value) * 2 + min(len(value), 34)
+    if "..." in value or "…" in value:
+        score += 10
+    if re.search(r"(衣柜|挂衣|吸尘器|猫草|短袖|上衣|手机|家用|车载|零食|盆栽)", value):
+        score += 8
+    return score
+
+
+def normalize_title(lines: list[str]) -> str:
+    text = "".join(clean_text(line) for line in lines)
+    text = re.sub(r"\s+", "", text)
+    return text.strip(" ：:，,。")
+
+
+def group_candidate_lines(lines: list[OcrLine]) -> list[list[OcrLine]]:
+    ordered = sorted(lines, key=lambda line: (box_center_y(line), box_center_x(line)))
+    groups: list[list[OcrLine]] = []
+    for line in ordered:
+        if not groups or box_center_y(line) - box_center_y(groups[-1][-1]) > 105:
+            groups.append([line])
+        else:
+            groups[-1].append(line)
+    return groups
+
+
+def extract_visible_price(text: str) -> str:
+    match = re.search(r"(?:¥|￥)\s*([0-9]+(?:[.,][0-9]{1,2})?)", text)
+    if not match:
+        return ""
+    return match.group(1).replace(",", ".")
+
+
+def fallback_visible_price(lines: list[OcrLine], amount_line: OcrLine, lower_bound: float) -> str:
+    amount_y = box_center_y(amount_line)
+    candidates = [
+        line
+        for line in lines
+        if lower_bound < box_center_y(line) < amount_y and box_center_x(line) > 900 and extract_visible_price(line.text)
+    ]
     if not candidates:
         return ""
-    return max(candidates, key=len)
+    price_line = max(candidates, key=box_center_y)
+    return extract_visible_price(price_line.text)
 
 
-def infer_spec(lines: list[str], text: str) -> str:
-    labeled = extract_first(
-        [
-            r"规格[:：]\s*([^\n]+)",
-            r"(?:颜色|尺码|尺寸)[:：]\s*([^\n]+)",
-        ],
-        text,
+def best_title_with_positions(lines: list[OcrLine], amount_line: OcrLine, lower_bound: float) -> str:
+    amount_y = box_center_y(amount_line)
+    window_top = max(lower_bound, amount_y - 440)
+    candidates = [
+        line
+        for line in lines
+        if window_top <= box_center_y(line) < amount_y - 8 and box_center_x(line) > 300 and is_title_candidate(line.text)
+    ]
+    if not candidates:
+        return ""
+
+    best_group = max(
+        group_candidate_lines(candidates),
+        key=lambda group: (sum(title_score(line.text) for line in group), -abs(box_center_y(group[0]) - amount_y)),
     )
-    if labeled:
-        return labeled
+    title_lines = [line.text for line in best_group[:3]]
+    return normalize_title(title_lines)
+
+
+def best_title_without_positions(candidates: list[str]) -> str:
+    if not candidates:
+        return ""
+    return normalize_title([max(candidates[-5:], key=title_score)])
+
+
+def extract_purchase_items(lines: list[OcrLine], image_name: str, start_index: int = 1) -> list[dict[str, str]]:
+    if any(line.box for line in lines):
+        ordered = sorted(lines, key=lambda line: (box_center_y(line), box_center_x(line)))
+        amount_lines = [line for line in ordered if extract_paid_amount(line.text)]
+        items: list[dict[str, str]] = []
+        previous_amount_y = 0.0
+        for amount_line in amount_lines:
+            title = best_title_with_positions(ordered, amount_line, previous_amount_y)
+            amount = extract_paid_amount(amount_line.text)
+            if "¥" not in clean_text(amount_line.text) and "￥" not in amount_line.text:
+                amount = fallback_visible_price(ordered, amount_line, previous_amount_y) or amount
+            if title and amount:
+                items.append(
+                    {
+                        "序号": str(start_index + len(items)),
+                        "商品信息": title,
+                        "实付款": amount,
+                        "截图文件": image_name,
+                    }
+                )
+            previous_amount_y = box_center_y(amount_line)
+        return items
+
+    items = []
+    title_candidates: list[str] = []
     for line in lines:
-        if re.search(r"(黑色|白色|灰色|蓝色|红色|绿色|黄色|紫色|粉色|XL|XXL|L码|M码|S码|均码)", line, re.IGNORECASE):
-            if len(line) <= 40 and not re.search(r"(实付|支付|合计|订单|下单|20\d{2})", line):
-                return line.strip(" xX×0123456789")
-    return ""
+        amount = extract_paid_amount(line.text)
+        if amount:
+            title = best_title_without_positions(title_candidates)
+            if title:
+                items.append(
+                    {
+                        "序号": str(start_index + len(items)),
+                        "商品信息": title,
+                        "实付款": amount,
+                        "截图文件": image_name,
+                    }
+                )
+            title_candidates = []
+        elif is_title_candidate(line.text):
+            title_candidates.append(line.text)
+    return items
 
 
-def infer_quantity(lines: list[str], text: str) -> str:
-    value = extract_first(
-        [
-            r"[xX×]\s*(\d+)",
-            r"数量[:：]?\s*(\d+)",
-            r"共\s*(\d+)\s*件",
-        ],
-        text,
-    )
-    if value:
-        return value
-    return "1"
-
-
-def parse_order_fields(text: str) -> dict[str, str]:
-    text = clean_ocr_text(text)
-    lines = text_lines(text)
-    compact = re.sub(r"[ \t]+", " ", text)
-    return {
-        "订单编号": infer_order_id(lines, compact),
-        "商品名称": infer_title(lines, text),
-        "商品规格": infer_spec(lines, text),
-        "数量": infer_quantity(lines, compact),
-        "订单金额": infer_amount(lines),
-        "订单状态": infer_status(lines),
-        "下单时间": infer_order_time(lines, text),
-    }
-
-
-def write_ocr_json(session_id: str, records: list[dict[str, Any]]) -> Path:
+def write_ocr_json(session_id: str, payload: dict[str, Any]) -> Path:
     path = DATA_DIR / f"{session_id}_ocr_result.json"
-    path.write_text(
-        json.dumps(records, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 
-def write_excel(session_id: str, records: list[dict[str, Any]]) -> Path:
+def write_excel(session_id: str, items: list[dict[str, str]]) -> Path:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "订单数据"
-    headers = [*ORDER_FIELDS, "截图文件", "OCR全文"]
-    sheet.append(headers)
-    for record in records:
-        parsed = record["parsed"]
-        sheet.append([*(parsed.get(field, "") for field in ORDER_FIELDS), record["image"], record["text"]])
+    sheet.append(EXPORT_FIELDS)
+    for item in items:
+        sheet.append([item.get(field, "") for field in EXPORT_FIELDS])
 
-    for column in sheet.columns:
-        max_length = max(len(str(cell.value or "")) for cell in column)
-        sheet.column_dimensions[column[0].column_letter].width = min(max(max_length + 2, 12), 60)
+    widths = {
+        "A": 8,
+        "B": 58,
+        "C": 14,
+        "D": 14,
+    }
+    for column, width in widths.items():
+        sheet.column_dimensions[column].width = width
 
     path = OUTPUTS_DIR / f"{session_id}_订单数据.xlsx"
     workbook.save(path)
     return path
-
-
-def set_capture_state(**kwargs: Any) -> None:
-    with capture_lock:
-        for key, value in kwargs.items():
-            setattr(capture_state, key, value)
-
-
-def get_capture_state_payload() -> dict[str, Any]:
-    with capture_lock:
-        payload = asdict(capture_state)
-        payload["records"] = capture_state.records or []
-        return payload
-
-
-def run_capture_job(settings: CaptureSettings, device: DeviceStatus) -> None:
-    assert device.device_id
-    session_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
-    session_dir = SCREENSHOTS_DIR / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
-    records: list[dict[str, Any]] = []
-    previous_image: Path | None = None
-    unchanged_count = 0
-
-    set_capture_state(
-        session_id=session_id,
-        running=True,
-        status="running",
-        current_step="准备采集",
-        screenshot_count=0,
-        ocr_count=0,
-        success_order_count=0,
-        skipped_count=0,
-        target_count=settings.max_count,
-        error="",
-        excel_file="",
-        ocr_result="",
-        records=records,
-    )
-
-    try:
-        for attempt in range(1, settings.max_count + 1):
-            if stop_capture_event.is_set():
-                set_capture_state(status="stopped", current_step="已停止")
-                break
-
-            image_name = next_screenshot_name(attempt, ".png")
-            image_path = session_dir / image_name
-            first_path = session_dir / f"stable_check_{attempt:03d}.png"
-            ocr_image_path = session_dir / f"ocr_{Path(image_name).stem}.png"
-
-            set_capture_state(current_step="截图")
-            save_phone_screenshot(device.device_id, first_path)
-            time.sleep(STABLE_WAIT_SECONDS)
-            save_phone_screenshot(device.device_id, image_path)
-            first_path.unlink(missing_ok=True)
-
-            if previous_image and image_difference_ratio(previous_image, image_path) < PAGE_CHANGE_THRESHOLD:
-                unchanged_count += 1
-                image_path.unlink(missing_ok=True)
-                set_capture_state(skipped_count=capture_state.skipped_count + 1, current_step="页面未变化，跳过 OCR")
-            else:
-                unchanged_count = 0
-                previous_image = image_path
-                set_capture_state(screenshot_count=capture_state.screenshot_count + 1, current_step="OCR 处理中")
-                preprocess_image(image_path, ocr_image_path)
-                lines = ocr_engine.recognize(ocr_image_path)
-                text = "\n".join(line.text for line in lines)
-                parsed = parse_order_fields(text)
-                record = {
-                    "image": image_name,
-                    "ocr_image": ocr_image_path.name,
-                    "text": text,
-                    "lines": [{"text": line.text, "score": line.score} for line in lines],
-                    "parsed": parsed,
-                }
-                records.append(record)
-                ocr_json_path = write_ocr_json(session_id, records)
-                excel_path = write_excel(session_id, records)
-                set_capture_state(
-                    ocr_count=capture_state.ocr_count + 1,
-                    success_order_count=sum(1 for item in records if is_successful_order(item["parsed"])),
-                    ocr_result=ocr_json_path.name,
-                    excel_file=excel_path.name,
-                    records=records,
-                    current_step="OCR 完成",
-                )
-
-            if unchanged_count >= MAX_UNCHANGED_CAPTURES:
-                set_capture_state(status="completed", current_step="页面连续无变化，已结束")
-                break
-
-            if attempt < settings.max_count and not stop_capture_event.is_set():
-                set_capture_state(current_step="滑动")
-                swipe_phone(device.device_id, settings.swipe_distance, device.resolution)
-                time.sleep(settings.interval_seconds)
-        else:
-            set_capture_state(status="completed", current_step="已完成")
-
-        if capture_state.status == "running":
-            set_capture_state(status="completed", current_step="已完成")
-        if not records:
-            ocr_json_path = write_ocr_json(session_id, records)
-            excel_path = write_excel(session_id, records)
-            set_capture_state(ocr_result=ocr_json_path.name, excel_file=excel_path.name)
-    except Exception as exc:
-        set_capture_state(running=False, status="error", current_step="采集失败", error=str(exc), records=records)
-        return
-
-    set_capture_state(running=False, records=records)
 
 
 @app.get("/api/health")
@@ -665,49 +395,6 @@ def config() -> dict[str, str | bool]:
     }
 
 
-@app.get("/api/device/status")
-def device_status() -> dict[str, Any]:
-    return asdict(get_device_status())
-
-
-@app.get("/api/device/screenshot")
-def device_screenshot() -> FileResponse:
-    device = get_device_status()
-    if not device.connected or not device.device_id:
-        raise HTTPException(status_code=503, detail=device.message or "手机未连接。")
-    preview_path = BASE_DIR / "work" / "device_screen.png"
-    save_phone_screenshot(device.device_id, preview_path)
-    return FileResponse(preview_path, media_type="image/png", filename="device_screen.png")
-
-
-@app.post("/api/capture/start")
-def start_capture(settings: CaptureSettings) -> dict[str, Any]:
-    with capture_lock:
-        if capture_state.running:
-            raise HTTPException(status_code=409, detail="采集任务正在运行。")
-
-    device = get_device_status()
-    if not device.connected or not device.device_id:
-        raise HTTPException(status_code=503, detail=device.message or "手机未连接。")
-
-    stop_capture_event.clear()
-    thread = threading.Thread(target=run_capture_job, args=(settings, device), daemon=True)
-    thread.start()
-    return get_capture_state_payload()
-
-
-@app.get("/api/capture/status")
-def capture_status() -> dict[str, Any]:
-    return get_capture_state_payload()
-
-
-@app.post("/api/capture/stop")
-def stop_capture() -> dict[str, Any]:
-    stop_capture_event.set()
-    set_capture_state(current_step="正在停止")
-    return get_capture_state_payload()
-
-
 @app.post("/api/ocr/upload")
 async def upload_screenshots(files: list[UploadFile] = File(...)) -> dict[str, Any]:
     ensure_dirs()
@@ -719,6 +406,7 @@ async def upload_screenshots(files: list[UploadFile] = File(...)) -> dict[str, A
     session_dir.mkdir(parents=True, exist_ok=True)
 
     records: list[dict[str, Any]] = []
+    all_items: list[dict[str, str]] = []
     for index, upload in enumerate(files, start=1):
         suffix = Path(upload.filename or "").suffix
         image_name = next_screenshot_name(index, suffix)
@@ -745,24 +433,29 @@ async def upload_screenshots(files: list[UploadFile] = File(...)) -> dict[str, A
             raise HTTPException(status_code=500, detail=f"OCR 识别失败：{exc}") from exc
 
         text = "\n".join(line.text for line in lines)
+        items = extract_purchase_items(lines, image_name, start_index=len(all_items) + 1)
+        all_items.extend(items)
         records.append(
             {
                 "image": image_name,
                 "ocr_image": ocr_image_path.name,
                 "text": text,
-                "lines": [{"text": line.text, "score": line.score} for line in lines],
-                "parsed": parse_order_fields(text),
+                "lines": [line_to_dict(line) for line in lines],
+                "items": items,
             }
         )
 
-    ocr_json_path = write_ocr_json(session_id, records)
-    excel_path = write_excel(session_id, records)
+    payload = {"session_id": session_id, "records": records, "items": all_items}
+    ocr_json_path = write_ocr_json(session_id, payload)
+    excel_path = write_excel(session_id, all_items)
     return {
         "session_id": session_id,
-        "count": len(records),
+        "image_count": len(records),
+        "item_count": len(all_items),
         "ocr_result": ocr_json_path.name,
         "excel_file": excel_path.name,
         "records": records,
+        "items": all_items,
     }
 
 
